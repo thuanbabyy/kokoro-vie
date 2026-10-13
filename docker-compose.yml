@@ -1,0 +1,22 @@
+services:
+  kokoro-train:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kokoro_lora_gpu
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./:/workspace
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: bash run_gpu_train.sh

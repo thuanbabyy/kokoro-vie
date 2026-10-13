@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+finetune_data/wavs/
+lora_output/
+*.wav
+*.mp3
+test_vieneu_samples/
