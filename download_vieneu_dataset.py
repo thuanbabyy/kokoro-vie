@@ -8,9 +8,19 @@ Script tai dataset VieNeu-TTS-140h tren GPU Server de finetune Kokoro
 import sys, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-import os, argparse, random
+import os, argparse, random, csv
 from datasets import load_dataset
 from tqdm import tqdm
+
+
+def write_metadata(path, samples):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="|", lineterminator="\n")
+        writer.writerow(["id", "text", "phoneme", "speaker"])
+        writer.writerows(
+            (item["id"], item["text"], item["phoneme"], item["speaker"])
+            for item in samples
+        )
 
 def main():
     parser = argparse.ArgumentParser(description="Tai dataset VieNeu-TTS-140h va chia tap Train/Val")
@@ -98,20 +108,10 @@ def main():
     train_data = saved_items[:train_size]
     val_data = saved_items[train_size:]
 
-    # Ghi file train_metadata.csv
-    with open(train_csv, "w", encoding="utf-8") as f:
-        for x in train_data:
-            f.write(f"{x['id']}|{x['text']}\n")
-
-    # Ghi file val_metadata.csv
-    with open(val_csv, "w", encoding="utf-8") as f:
-        for x in val_data:
-            f.write(f"{x['id']}|{x['text']}\n")
-
-    # Ghi file metadata.csv (toan bo)
-    with open(all_csv, "w", encoding="utf-8") as f:
-        for x in saved_items:
-            f.write(f"{x['id']}|{x['text']}\n")
+    # Preserve phonemes and speaker IDs for multi-speaker training.
+    write_metadata(train_csv, train_data)
+    write_metadata(val_csv, val_data)
+    write_metadata(all_csv, saved_items)
 
     print("\n" + "=" * 65)
     print("  KET QUA PHAN CHIA DATASET")

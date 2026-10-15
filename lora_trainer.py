@@ -8,6 +8,9 @@ import sys, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 import os, json, torch, torch.nn as nn
+import csv
+from itertools import chain
+from collections import Counter
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 import time
@@ -74,6 +77,9 @@ class LoRALinear(nn.Module):
 
 def inject_lora(model, targets, rank, alpha, dropout, verbose=True):
     count, trainable = 0, 0
+    for param in model.parameters():
+        param.requires_grad = False
+
     for name, mod in list(model.named_modules()):
         if not isinstance(mod, nn.Linear):
             continue
@@ -124,16 +130,27 @@ class TTSDataset(Dataset):
         self.sr   = sr
 
         with open(metadata_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or "|" not in line:
+            reader = csv.reader(f, delimiter="|")
+            first_row = next(reader, None)
+            if first_row == ["id", "text", "phoneme", "speaker"]:
+                rows = reader
+            else:
+                rows = chain([first_row] if first_row else [], reader)
+
+            for row in rows:
+                if not row or len(row) < 2:
                     continue
-                uid, text = line.split("|", 1)
+                uid, text = row[0].strip(), row[1].strip()
+                phoneme = row[2].strip() if len(row) > 2 else ""
+                speaker = row[3].strip() if len(row) > 3 else "unknown"
                 wav_path  = os.path.join(wav_dir, f"{uid}.wav")
                 if os.path.exists(wav_path):
                     dur = librosa.get_duration(path=wav_path)
                     if dur <= max_dur:
-                        self.data.append({"id": uid, "text": text, "wav": wav_path})
+                        self.data.append({
+                            "id": uid, "text": text, "phoneme": phoneme,
+                            "speaker": speaker, "wav": wav_path,
+                        })
 
         print(f"  [Dataset] Loaded {len(self.data)} samples")
 
@@ -144,7 +161,12 @@ class TTSDataset(Dataset):
         import librosa
         item  = self.data[idx]
         audio, _ = librosa.load(item["wav"], sr=self.sr, mono=True)
-        return {"text": item["text"], "audio": torch.FloatTensor(audio)}
+        return {
+            "text": item["text"],
+            "phoneme": item["phoneme"],
+            "speaker": item["speaker"],
+            "audio": torch.FloatTensor(audio),
+        }
 
 
 def collate_fn(batch):
@@ -152,15 +174,49 @@ def collate_fn(batch):
     max_len = max(x["audio"].shape[0] for x in batch)
     audios  = torch.zeros(len(batch), max_len)
     texts   = []
+    phonemes = []
+    speakers = []
     for i, x in enumerate(batch):
         n = x["audio"].shape[0]
         audios[i, :n] = x["audio"]
         texts.append(x["text"])
-    return {"text": texts, "audio": audios}
+        phonemes.append(x["phoneme"])
+        speakers.append(x["speaker"])
+    return {
+        "text": texts, "phoneme": phonemes, "speaker": speakers,
+        "audio": audios,
+    }
+
+
+def report_preflight(model, train_dataset, val_dataset=None):
+    print("\n  [Preflight] Dataset and Kokoro compatibility")
+    print(f"  Train samples: {len(train_dataset)}")
+    print(f"  Speakers: {len({item['speaker'] for item in train_dataset.data})}")
+
+    if not train_dataset.data or any(not item["phoneme"] for item in train_dataset.data):
+        raise ValueError(
+            "Metadata must contain phoneme and speaker columns. "
+            "Regenerate it with the updated downloader before continuing."
+        )
+
+    counts = Counter(item["speaker"] for item in train_dataset.data)
+    print(f"  Samples per speaker: min={min(counts.values())}, max={max(counts.values())}")
+    if val_dataset is not None:
+        print(f"  Validation samples: {len(val_dataset)}")
+
+    symbols = set("".join(item["phoneme"] for item in train_dataset.data))
+    missing = sorted(symbols - set(model.vocab))
+    print(f"  Phoneme symbols in data: {len(symbols)}")
+    print(f"  Symbols missing from Kokoro vocab: {missing!r}")
+    if missing:
+        raise ValueError(
+            "Kokoro silently drops phoneme symbols absent from its vocabulary; "
+            "resolve these symbols before training."
+        )
 
 
 # ================================================================
-# TRAINING LOOP (simplified - can kokoro package de chay day du)
+# TRAINING LOOP
 # ================================================================
 def compute_mel(audio, sr=24000, n_mels=80, n_fft=1024, hop=256):
     """Tinh mel spectrogram don gian"""
@@ -195,103 +251,21 @@ class LoRATrainer:
         self.loss_history = []
 
     def train_epoch(self, dataloader, epoch):
-        self.model.train()
-        total_loss = 0.0
-        n_steps    = 0
-
-        for batch in dataloader:
-            audio = batch["audio"].to(self.device)
-            texts = batch["text"]
-
-            # Tinh mel target
-            mel_target = compute_mel(audio)
-
-            # Forward qua model (can kokoro package de co model dung)
-            # Hien tai: simplified loss de demo
-            self.optimizer.zero_grad()
-
-            # Placeholder forward - thay the bang Kokoro forward pass
-            # mel_pred = self.model(texts, ...)
-            # loss = F.l1_loss(mel_pred, mel_target)
-
-            # Demo: L2 loss tren embedding gia lap
-            dummy_pred = torch.randn_like(mel_target, requires_grad=True)
-            loss = nn.functional.mse_loss(dummy_pred, mel_target)
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad],
-                self.cfg["grad_clip"]
-            )
-            self.optimizer.step()
-            self.scheduler.step()
-
-            total_loss += loss.item()
-            n_steps    += 1
-
-        avg_loss = total_loss / max(n_steps, 1)
-        self.loss_history.append(avg_loss)
-        return avg_loss
+        raise NotImplementedError(
+            "Kokoro's released inference forward is no_grad and this project "
+            "does not yet implement a differentiable multi-speaker training loss."
+        )
 
     def validate(self, val_loader):
-        if val_loader is None or len(val_loader) == 0:
-            return None
-        self.model.eval()
-        total_loss = 0.0
-        n_steps    = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                audio = batch["audio"].to(self.device)
-                mel_target = compute_mel(audio)
-                dummy_pred = torch.randn_like(mel_target)
-                loss = nn.functional.mse_loss(dummy_pred, mel_target)
-                total_loss += loss.item()
-                n_steps    += 1
-        return total_loss / max(n_steps, 1)
+        raise NotImplementedError(
+            "Validation requires the same real Kokoro training objective as training."
+        )
 
     def train(self, train_loader, val_loader=None):
-        print(f"\n  Bat dau training tren {self.device}...")
-        print(f"  Epochs: {self.cfg['epochs']} | LR: {self.cfg['lr']}")
-        if val_loader:
-            print(f"  [Eval] Tap validation: {len(val_loader.dataset)} mau")
-        print()
-
-        best_val_loss = float("inf")
-
-        for epoch in range(1, self.cfg["epochs"] + 1):
-            t0   = time.time()
-            loss = self.train_epoch(train_loader, epoch)
-            val_loss = self.validate(val_loader)
-            dt   = time.time() - t0
-            lr   = self.scheduler.get_last_lr()[0]
-
-            log_str = f"  Epoch {epoch:3d}/{self.cfg['epochs']} | Train Loss: {loss:.4f}"
-            if val_loss is not None:
-                log_str += f" | Val Loss: {val_loss:.4f}"
-            log_str += f" | LR: {lr:.2e} | Time: {dt:.1f}s"
-            print(log_str)
-
-            # Luu best checkpoint
-            if val_loss is not None and val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_ckpt = os.path.join(self.cfg["output_dir"], "lora_best.pt")
-                save_lora_weights(self.model, best_ckpt)
-
-            # Luu checkpoint dinh ky
-            if epoch % self.cfg["save_every"] == 0:
-                ckpt = os.path.join(self.cfg["output_dir"],
-                                    f"lora_rank{self.cfg['lora_rank']}_epoch{epoch}.pt")
-                save_lora_weights(self.model, ckpt)
-
-        # Luu final
-        final = os.path.join(self.cfg["output_dir"], "lora_final.pt")
-        save_lora_weights(self.model, final)
-        print(f"\n  [DONE] LoRA weights da luu tai: {self.cfg['output_dir']}")
-
-        # Luu loss history
-        loss_path = os.path.join(self.cfg["output_dir"], "loss_history.json")
-        with open(loss_path, "w") as f:
-            json.dump(self.loss_history, f)
+        raise NotImplementedError(
+            "Training is intentionally stopped: do not interpret the former "
+            "random demo loss or its checkpoints as a trained Kokoro adapter."
+        )
 
 
 # ================================================================
@@ -323,23 +297,11 @@ def main():
 
     print(f"\n  Tim thay {len(wav_files)} file audio")
 
-    # Import kokoro model (can cai pip install kokoro)
-    try:
-        from kokoro import KModel
-        model = KModel(CFG["model_dir"])
-        print("  [OK] Da load Kokoro model")
-    except ImportError:
-        print("  [!] Chua cai kokoro package")
-        print("  Chay: pip install kokoro")
-        print("\n  [Demo mode] Tao model gia lap de test LoRA injection...")
-
-        from transformers import BertModel, BertConfig
-        config = BertConfig(
-            hidden_size=256, num_attention_heads=4,
-            num_hidden_layers=2, intermediate_size=512
-        )
-        model = BertModel(config)
-        print("  [OK] Da tao BERT demo model")
+    from kokoro import KModel
+    config_path = os.path.join(CFG["model_dir"], "config.json")
+    checkpoint_path = os.path.join(CFG["model_dir"], "kokoro-v1_0.pth")
+    model = KModel(config=config_path, model=checkpoint_path)
+    print("  [OK] Da load Kokoro model tu checkpoint local")
 
     # Inject LoRA
     print("\n  Dang inject LoRA...")
@@ -351,32 +313,15 @@ def main():
         dropout  = CFG["lora_dropout"],
     )
 
-    # Load dataset
-    print("\n  Dang load dataset...")
-    try:
-        train_ds = TTSDataset(train_meta, CFG["wav_dir"], CFG["sample_rate"])
-        train_loader = DataLoader(train_ds, batch_size=CFG["batch_size"],
-                                  shuffle=True, collate_fn=collate_fn)
+    print("\n  Dang load metadata...")
+    train_ds = TTSDataset(train_meta, CFG["wav_dir"], CFG["sample_rate"])
+    val_ds = None
+    if val_meta and os.path.exists(val_meta):
+        val_ds = TTSDataset(val_meta, CFG["wav_dir"], CFG["sample_rate"])
 
-        val_loader = None
-        if val_meta and os.path.exists(val_meta):
-            val_ds = TTSDataset(val_meta, CFG["wav_dir"], CFG["sample_rate"])
-            val_loader = DataLoader(val_ds, batch_size=CFG["batch_size"],
-                                    shuffle=False, collate_fn=collate_fn)
-
-        # Train
-        trainer = LoRATrainer(model, CFG)
-        trainer.train(train_loader, val_loader)
-
-    except ImportError as e:
-        print(f"\n  [!] Thieu thu vien: {e}")
-        print("  Chay: pip install librosa soundfile")
-
-        # Giai thich cau truc ma khong train
-        print("\n  [INFO] LoRA da san sang - chi can:")
-        print("  1. pip install kokoro librosa soundfile")
-        print("  2. Them audio vao wavs/")
-        print("  3. Chay lai script nay")
+    report_preflight(model, train_ds, val_ds)
+    print("\n  [PREFLIGHT ONLY] Data/model checks passed.")
+    print("  No training was started: a differentiable Kokoro training loss is not implemented.")
 
 
 if __name__ == "__main__":

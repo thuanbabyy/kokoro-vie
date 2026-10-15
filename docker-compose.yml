@@ -6,7 +6,7 @@ services:
     container_name: kokoro_lora_gpu
     runtime: nvidia
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_VISIBLE_DEVICES=0
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./:/workspace
@@ -17,6 +17,6 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ["0"]
               capabilities: [gpu]
     command: bash run_gpu_train.sh

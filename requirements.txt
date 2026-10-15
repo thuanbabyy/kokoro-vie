@@ -1,6 +1,7 @@
 torch>=2.2.0
 torchaudio>=2.2.0
 transformers>=4.38.0
+kokoro>=0.9.4
 datasets>=2.18.0
 accelerate>=0.28.0
 peft>=0.10.0
