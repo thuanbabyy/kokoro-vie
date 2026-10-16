@@ -457,6 +457,9 @@ def main():
         torch.save(payload, temporary_path)
         os.replace(temporary_path, path)
 
+    if start_epoch == 1 and not os.path.exists(last_checkpoint_path):
+        save_checkpoint(last_checkpoint_path, make_checkpoint(0))
+
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         speaker_deltas.train()
