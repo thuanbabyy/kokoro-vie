@@ -14,6 +14,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from lora_trainer import CFG, LoRALinear
 
+KOKORO_FRAME_RATE = 40
+
 
 def load_alignment_index(path):
     index = {}
@@ -89,7 +91,7 @@ class AlignedVieNeuDataset(Dataset):
                             valid = False
                             break
                         token_ids.append(token_id)
-                        durations.append(max(0, round(gap * 80)))
+                        durations.append(max(0, round(gap * KOKORO_FRAME_RATE)))
 
                 if not valid:
                     continue

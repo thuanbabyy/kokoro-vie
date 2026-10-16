@@ -13,7 +13,7 @@ from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 ALIGNER_ID = "nguyenvulebinh/wav2vec2-base-vietnamese-250h"
 SAMPLE_RATE = 16000
-KOKORO_FRAME_RATE = 80
+KOKORO_FRAME_RATE = 40
 
 
 def ctc_viterbi(log_probs, labels, blank_id):
