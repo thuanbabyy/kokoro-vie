@@ -39,8 +39,6 @@ def distribute_word_frames(phone_word, frame_count):
     if not weights:
         return []
 
-    minimum_total = sum(weight >= 1.0 for weight in weights)
-    frame_count = max(frame_count, minimum_total)
     exact = [frame_count * weight / sum(weights) for weight in weights]
     allocated = [int(value) for value in exact]
     remainder = frame_count - sum(allocated)
