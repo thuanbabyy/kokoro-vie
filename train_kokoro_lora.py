@@ -276,6 +276,8 @@ def main():
                         help="Limit training rows for the first pilot; 0 uses all rows")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="CPU workers for loading audio; use 0 to disable multiprocessing")
     parser.add_argument("--resume", help="Resume from kokoro_vi_experimental_last.pt")
     parser.add_argument("--init-adapter", help="Warm-start model/LoRA from a completed adapter, with a fresh optimizer")
     args = parser.parse_args()
@@ -283,6 +285,8 @@ def main():
         raise SystemExit("Pass --train to start the experimental loop; generate CTC alignments first.")
     if args.resume and args.init_adapter:
         raise ValueError("Use either --resume or --init-adapter, not both")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be >= 0")
 
     for path in (args.train_alignment, args.val_alignment):
         if not os.path.isfile(path):
@@ -371,11 +375,19 @@ def main():
     if val_dataset is not None and args.max_samples:
         val_dataset.items = val_dataset.items[:max(1, args.max_samples // 5)]
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_aligned
-    )
+    pin_memory = CFG["device"] == "cuda"
+    loader_options = {
+        "batch_size": args.batch_size,
+        "collate_fn": collate_aligned,
+        "num_workers": args.num_workers,
+        "pin_memory": pin_memory,
+    }
+    if args.num_workers > 0:
+        loader_options.update(persistent_workers=True, prefetch_factor=2)
+
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_options)
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_aligned
+        val_dataset, shuffle=False, **loader_options
     ) if val_dataset is not None and len(val_dataset) else None
 
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -387,11 +399,12 @@ def main():
     ).to(CFG["device"])
 
     def batch_loss(batch):
-        token_ids = batch["token_ids"].to(CFG["device"])
-        token_lengths = batch["token_lengths"].to(CFG["device"])
-        alignment = batch["alignment"].to(CFG["device"])
-        target_durations = batch["duration_targets"].to(CFG["device"])
-        styles = base_voice.unsqueeze(0) + speaker_deltas(batch["speaker_ids"].to(CFG["device"]))
+        token_ids = batch["token_ids"].to(CFG["device"], non_blocking=pin_memory)
+        token_lengths = batch["token_lengths"].to(CFG["device"], non_blocking=pin_memory)
+        alignment = batch["alignment"].to(CFG["device"], non_blocking=pin_memory)
+        target_durations = batch["duration_targets"].to(CFG["device"], non_blocking=pin_memory)
+        speaker_ids = batch["speaker_ids"].to(CFG["device"], non_blocking=pin_memory)
+        styles = base_voice.unsqueeze(0) + speaker_deltas(speaker_ids)
         prediction, predicted_durations = train_forward(
             model, token_ids, token_lengths, alignment, styles
         )
@@ -401,7 +414,9 @@ def main():
         )
         mel_losses = []
         for index, target_length in enumerate(batch["audio_lengths"].tolist()):
-            target = batch["audio"][index, :target_length].to(CFG["device"])
+            target = batch["audio"][index, :target_length].to(
+                CFG["device"], non_blocking=pin_memory
+            )
             predicted = prediction[index].reshape(-1)
             common = min(target.numel(), predicted.numel())
             if common < 1024:
