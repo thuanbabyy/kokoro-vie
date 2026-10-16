@@ -533,6 +533,15 @@ def main():
         torch.save(payload, temporary_path)
         os.replace(temporary_path, path)
 
+    if resume_payload is None:
+        generator = torch.Generator().manual_seed(42 + start_epoch)
+        resume_order = torch.randperm(len(train_dataset), generator=generator).tolist()
+        save_checkpoint(
+            last_checkpoint_path,
+            make_checkpoint(start_epoch, 0, resume_order, 0.0, 0),
+        )
+        print(f"Saved initial checkpoint: epoch={start_epoch} step=0")
+
     restore_rng = resume_payload is not None
     for epoch in range(start_epoch, args.epochs + 1):
         if epoch == start_epoch and resume_order is not None:
