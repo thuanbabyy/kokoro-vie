@@ -155,6 +155,7 @@ def collate_aligned(batch):
     alignment = torch.zeros(batch_size, max_tokens, max_frames)
     audio = torch.zeros(batch_size, max_audio)
     audio_lengths = torch.zeros(batch_size, dtype=torch.long)
+    frame_lengths = torch.zeros(batch_size, dtype=torch.long)
     speaker_ids = torch.zeros(batch_size, dtype=torch.long)
 
     for row, item in enumerate(batch):
@@ -164,6 +165,7 @@ def collate_aligned(batch):
         token_lengths[row] = len(ids)
         duration_targets[row, :len(ids)] = durations
         frame_count = int(durations.sum().item())
+        frame_lengths[row] = frame_count
         if frame_count:
             token_positions = torch.repeat_interleave(torch.arange(len(ids)), durations)
             alignment[row, token_positions, torch.arange(frame_count)] = 1.0
@@ -179,6 +181,7 @@ def collate_aligned(batch):
         "alignment": alignment,
         "audio": audio,
         "audio_lengths": audio_lengths,
+        "frame_lengths": frame_lengths,
         "speaker_ids": speaker_ids,
     }
 
@@ -443,15 +446,22 @@ def main():
                 CFG["device"], non_blocking=pin_memory
             )
             predicted = prediction[index].reshape(-1)
-            common = min(target.numel(), predicted.numel())
+            expected_length = int(batch["frame_lengths"][index].item()) * (24000 // KOKORO_FRAME_RATE)
+            target_coverage = min(target.numel(), expected_length) / max(target.numel(), expected_length)
+            if target_coverage < 0.8:
+                raise RuntimeError(
+                    f"Target/alignment length mismatch ({target_coverage:.1%} overlap): "
+                    f"audio={target.numel()} samples, duration={expected_length} samples"
+                )
+            predicted_coverage = min(predicted.numel(), expected_length) / max(predicted.numel(), expected_length)
+            if predicted_coverage < 0.8:
+                raise RuntimeError(
+                    f"Generated/alignment length mismatch ({predicted_coverage:.1%} overlap): "
+                    f"generated={predicted.numel()} samples, duration={expected_length} samples"
+                )
+            common = min(target.numel(), predicted.numel(), expected_length)
             if common < 1024:
                 continue
-            coverage = common / max(target.numel(), predicted.numel())
-            if coverage < 0.8:
-                raise RuntimeError(
-                    f"Generated/target audio length mismatch ({coverage:.1%} overlap); "
-                    "check the alignment frame-rate assumption."
-                )
             target_mel = torch.log(mel_transform(target[:common]).clamp_min(1e-5))
             predicted_mel = torch.log(mel_transform(predicted[:common]).clamp_min(1e-5))
             mel_frames = min(target_mel.shape[-1], predicted_mel.shape[-1])
