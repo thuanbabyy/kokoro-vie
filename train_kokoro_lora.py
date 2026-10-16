@@ -279,6 +279,12 @@ def main():
     if not args.train:
         raise SystemExit("Pass --train to start the experimental loop; generate CTC alignments first.")
 
+    for path in (args.train_alignment, args.val_alignment):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Alignment file not found: {path}. Run align_vieneu.py successfully first."
+            )
+
     from kokoro import KModel, KPipeline
     config_path = os.path.join(CFG["model_dir"], "config.json")
     checkpoint_path = os.path.join(CFG["model_dir"], "kokoro-v1_0.pth")
@@ -320,7 +326,7 @@ def main():
         train_dataset.items = train_dataset.items[:args.max_samples]
     val_dataset = AlignedVieNeuDataset(
         CFG["val_meta"], args.val_alignment, CFG["wav_dir"], speaker_to_id
-    ) if os.path.isfile(args.val_alignment) else None
+    )
     if not len(train_dataset):
         raise RuntimeError("No aligned training samples remain after validation")
     if val_dataset is not None and args.max_samples:
