@@ -144,6 +144,8 @@ def main():
     parser.add_argument("--max-samples", type=int, default=128,
                         help="Limit pilot size; use 0 to process all rows")
     parser.add_argument("--model", default=ALIGNER_ID)
+    parser.add_argument("--resume", action="store_true",
+                        help="Keep completed alignment records and process remaining IDs")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -152,14 +154,38 @@ def main():
     model = Wav2Vec2ForCTC.from_pretrained(args.model).to(device).eval()
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    existing_ids = set()
+    if args.resume and os.path.isfile(args.output):
+        with open(args.output, "rb+") as previous:
+            contents = previous.read()
+            last_newline = contents.rfind(b"\n")
+            if last_newline < len(contents) - 1:
+                contents = contents[:last_newline + 1]
+                previous.seek(len(contents))
+                previous.truncate()
+
+            for line_number, line in enumerate(contents.splitlines(), start=1):
+                if not line.strip():
+                    continue
+                try:
+                    existing_ids.add(json.loads(line)["id"])
+                except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as error:
+                    raise ValueError(
+                        f"Cannot resume: invalid record in {args.output} at line {line_number}"
+                    ) from error
+        print(f"Resuming: {len(existing_ids)} IDs already aligned")
+
     total = aligned = skipped = 0
+    output_mode = "a" if args.resume else "w"
     with open(args.metadata, encoding="utf-8", newline="") as source, \
-            open(args.output, "w", encoding="utf-8") as target:
+            open(args.output, output_mode, encoding="utf-8") as target:
         rows = csv.DictReader(source, delimiter="|")
         for row in rows:
             if args.max_samples and total >= args.max_samples:
                 break
             total += 1
+            if row["id"] in existing_ids:
+                continue
             wav_path = os.path.join(args.wav_dir, f"{row['id']}.wav")
             try:
                 words, timings = align_sample(model, processor, wav_path, row["text"], device)
@@ -176,6 +202,8 @@ def main():
                     "word_timings": timings,
                 }
                 target.write(json.dumps(record, ensure_ascii=False) + "\n")
+                target.flush()
+                existing_ids.add(row["id"])
                 aligned += 1
             except Exception as error:
                 skipped += 1
@@ -184,9 +212,12 @@ def main():
             if total % 16 == 0:
                 print(f"Processed {total}: aligned={aligned}, skipped={skipped}")
 
-    print(f"Done: aligned={aligned}, skipped={skipped}, output={args.output}")
+    print(
+        f"Done: aligned_this_run={aligned}, already_aligned={len(existing_ids) - aligned}, "
+        f"skipped={skipped}, output={args.output}"
+    )
     print("Word timings are approximate; they are not phoneme-level ground truth.")
-    if aligned == 0:
+    if not existing_ids:
         raise RuntimeError("No samples aligned; refusing to continue with an empty alignment file")
 
 
