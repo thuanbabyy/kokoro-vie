@@ -453,10 +453,11 @@ def main():
                     f"Target/alignment length mismatch ({target_coverage:.1%} overlap): "
                     f"audio={target.numel()} samples, duration={expected_length} samples"
                 )
-            predicted_coverage = min(predicted.numel(), expected_length) / max(predicted.numel(), expected_length)
+            predicted_coverage = min(predicted.numel(), expected_length) / expected_length
             if predicted_coverage < 0.8:
                 raise RuntimeError(
-                    f"Generated/alignment length mismatch ({predicted_coverage:.1%} overlap): "
+                    f"Generated audio is shorter than this sample's aligned duration "
+                    f"({predicted_coverage:.1%} coverage): "
                     f"generated={predicted.numel()} samples, duration={expected_length} samples"
                 )
             common = min(target.numel(), predicted.numel(), expected_length)
