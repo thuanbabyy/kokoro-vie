@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import unicodedata
 from collections import Counter
@@ -278,6 +279,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4,
                         help="CPU workers for loading audio; use 0 to disable multiprocessing")
+    parser.add_argument("--save-every-steps", type=int, default=250,
+                        help="Save a resumable checkpoint every N optimizer steps")
     parser.add_argument("--resume", help="Resume from kokoro_vi_experimental_last.pt")
     parser.add_argument("--init-adapter", help="Warm-start model/LoRA from a completed adapter, with a fresh optimizer")
     args = parser.parse_args()
@@ -287,6 +290,8 @@ def main():
         raise ValueError("Use either --resume or --init-adapter, not both")
     if args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
+    if args.save_every_steps < 1:
+        raise ValueError("--save-every-steps must be >= 1")
 
     for path in (args.train_alignment, args.val_alignment):
         if not os.path.isfile(path):
@@ -385,7 +390,6 @@ def main():
     if args.num_workers > 0:
         loader_options.update(persistent_workers=True, prefetch_factor=2)
 
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_options)
     val_loader = DataLoader(
         val_dataset, shuffle=False, **loader_options
     ) if val_dataset is not None and len(val_dataset) else None
@@ -438,22 +442,40 @@ def main():
         mel_loss = torch.stack(mel_losses).mean()
         return mel_loss + 0.1 * duration_loss, mel_loss.detach(), duration_loss.detach()
 
-    total_steps = max(1, len(train_loader) * args.epochs)
+    steps_per_epoch = math.ceil(len(train_dataset) / args.batch_size)
+    total_steps = max(1, steps_per_epoch * args.epochs)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=CFG["lr"], total_steps=total_steps, pct_start=0.1
     )
+    resume_step = 0
+    resume_order = None
+    resume_loss_sum = 0.0
+    resume_loss_count = 0
     if resume_payload is not None:
         optimizer.load_state_dict(resume_payload["optimizer"])
         scheduler.load_state_dict(resume_payload["scheduler"])
-        start_epoch = resume_payload["epoch"] + 1
-        print(f"Resuming at epoch {start_epoch}/{args.epochs}")
+        saved_step = resume_payload.get("step_in_epoch")
+        if saved_step is not None and saved_step < steps_per_epoch:
+            start_epoch = resume_payload["epoch"]
+            resume_step = saved_step
+            resume_order = resume_payload.get("epoch_order")
+            if resume_order is None or len(resume_order) != len(train_dataset):
+                raise ValueError("Checkpoint lacks the sample order required for mid-epoch resume")
+            resume_loss_sum = resume_payload.get("epoch_loss_sum", 0.0)
+            resume_loss_count = resume_payload.get("epoch_loss_count", 0)
+        else:
+            start_epoch = max(1, resume_payload["epoch"] + 1)
+        print(
+            f"Resuming at epoch {start_epoch}/{args.epochs}, "
+            f"step {resume_step}/{steps_per_epoch}"
+        )
     else:
         start_epoch = 1
 
     os.makedirs(CFG["output_dir"], exist_ok=True)
     last_checkpoint_path = os.path.join(CFG["output_dir"], "kokoro_vi_experimental_last.pt")
 
-    def make_checkpoint(epoch):
+    def make_checkpoint(epoch, step_in_epoch, epoch_order, loss_sum, loss_count):
         lora_state = {
             key: value.detach().cpu()
             for key, value in model.state_dict().items()
@@ -470,8 +492,14 @@ def main():
             "base_voice": base_voice.detach().cpu(),
             "alignment": "CTC word timing with estimated per-phoneme durations",
             "epoch": epoch,
+            "step_in_epoch": step_in_epoch,
+            "epoch_order": epoch_order,
+            "epoch_loss_sum": loss_sum,
+            "epoch_loss_count": loss_count,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "training_args": {
                 "epochs": args.epochs,
                 "batch_size": args.batch_size,
@@ -484,18 +512,37 @@ def main():
         torch.save(payload, temporary_path)
         os.replace(temporary_path, path)
 
-    if start_epoch == 1 and not os.path.exists(last_checkpoint_path):
-        save_checkpoint(last_checkpoint_path, make_checkpoint(0))
-
+    restore_rng = resume_payload is not None
     for epoch in range(start_epoch, args.epochs + 1):
+        if epoch == start_epoch and resume_order is not None:
+            epoch_order = resume_order
+            first_step = resume_step
+            running_sum = resume_loss_sum
+            running_count = resume_loss_count
+        else:
+            generator = torch.Generator().manual_seed(42 + epoch)
+            epoch_order = torch.randperm(len(train_dataset), generator=generator).tolist()
+            first_step = 0
+            running_sum = 0.0
+            running_count = 0
+
+        remaining_indices = epoch_order[first_step * args.batch_size:]
+        epoch_dataset = torch.utils.data.Subset(train_dataset, remaining_indices)
+        train_loader = DataLoader(epoch_dataset, shuffle=False, **loader_options)
         model.train()
         speaker_deltas.train()
-        running = []
-        for step, batch in enumerate(train_loader, start=1):
+        if restore_rng:
+            if resume_payload.get("torch_rng_state") is not None:
+                torch.set_rng_state(resume_payload["torch_rng_state"])
+            if torch.cuda.is_available() and resume_payload.get("cuda_rng_state") is not None:
+                torch.cuda.set_rng_state_all(resume_payload["cuda_rng_state"])
+            restore_rng = False
+
+        for step, batch in enumerate(train_loader, start=first_step + 1):
             optimizer.zero_grad(set_to_none=True)
             loss, mel_loss, duration_loss = batch_loss(batch)
             loss.backward()
-            if step == 1:
+            if step == first_step + 1:
                 lora_grad = sum(
                     parameter.grad.norm().item()
                     for name, parameter in model.named_parameters()
@@ -517,13 +564,20 @@ def main():
             torch.nn.utils.clip_grad_norm_(parameters, CFG["grad_clip"])
             optimizer.step()
             scheduler.step()
-            running.append(loss.item())
+            running_sum += loss.item()
+            running_count += 1
             if step % 10 == 0:
                 print(
-                    f"epoch={epoch} step={step}/{len(train_loader)} "
+                    f"epoch={epoch} step={step}/{steps_per_epoch} "
                     f"loss={loss.item():.4f} mel={mel_loss.item():.4f} "
                     f"duration={duration_loss.item():.4f}"
                 )
+            if step % args.save_every_steps == 0:
+                save_checkpoint(
+                    last_checkpoint_path,
+                    make_checkpoint(epoch, step, epoch_order, running_sum, running_count),
+                )
+                print(f"Saved mid-epoch checkpoint: epoch={epoch} step={step}")
 
         validation = None
         if val_loader is not None:
@@ -536,17 +590,27 @@ def main():
                     values.append(loss.item())
             validation = sum(values) / max(1, len(values))
         print(
-            f"epoch={epoch} train_loss={sum(running) / max(1, len(running)):.4f} "
+            f"epoch={epoch} train_loss={running_sum / max(1, running_count):.4f} "
             f"val_loss={validation if validation is not None else 'n/a'}"
         )
-        save_checkpoint(last_checkpoint_path, make_checkpoint(epoch))
+        save_checkpoint(
+            last_checkpoint_path,
+            make_checkpoint(epoch, steps_per_epoch, epoch_order, running_sum, running_count),
+        )
         print(f"Saved resumable checkpoint: {last_checkpoint_path}")
+        resume_order = None
+        resume_step = 0
+        resume_loss_sum = 0.0
+        resume_loss_count = 0
 
     adapter_path = os.path.join(CFG["output_dir"], "kokoro_vi_experimental.pt")
-    final_epoch = min(args.epochs, resume_payload["epoch"] if resume_payload else 0)
     if start_epoch <= args.epochs:
-        final_epoch = args.epochs
-    save_checkpoint(adapter_path, make_checkpoint(final_epoch))
+        final_payload = make_checkpoint(
+            args.epochs, steps_per_epoch, epoch_order, running_sum, running_count
+        )
+    else:
+        final_payload = resume_payload
+    save_checkpoint(adapter_path, final_payload)
     print(f"Saved experimental adapter: {adapter_path}")
     print("This checkpoint requires a matching custom loader; it is not merge_lora.py compatible.")
 
