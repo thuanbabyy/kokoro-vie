@@ -284,6 +284,8 @@ def main():
             raise FileNotFoundError(
                 f"Alignment file not found: {path}. Run align_vieneu.py successfully first."
             )
+        if os.path.getsize(path) == 0:
+            raise RuntimeError(f"Alignment file is empty: {path}. Alignment must succeed before training.")
 
     from kokoro import KModel, KPipeline
     config_path = os.path.join(CFG["model_dir"], "config.json")

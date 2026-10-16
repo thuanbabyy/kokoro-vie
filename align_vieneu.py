@@ -89,9 +89,25 @@ def align_sample(model, processor, audio_path, text, device):
     tokenizer = processor.tokenizer
     delimiter_id = tokenizer.convert_tokens_to_ids(tokenizer.word_delimiter_token)
     unknown_id = tokenizer.unk_token_id
-    word_ids = [tokenizer(word, add_special_tokens=False).input_ids for word in words]
-    if any(not ids or (unknown_id is not None and unknown_id in ids) for ids in word_ids):
-        raise ValueError("Transcript contains symbols unknown to the CTC tokenizer")
+    word_ids = []
+    unknown_chars = set()
+    for word in words:
+        ids = []
+        for char in word:
+            token_id = tokenizer.convert_tokens_to_ids(char)
+            if token_id is None or (unknown_id is not None and token_id == unknown_id):
+                category = unicodedata.category(char)
+                if category[0] in "PS" or category == "Cf":
+                    continue
+                unknown_chars.add(f"{char!r} (U+{ord(char):04X})")
+            else:
+                ids.append(token_id)
+        word_ids.append(ids)
+
+    if unknown_chars:
+        raise ValueError(f"CTC tokenizer does not support characters: {sorted(unknown_chars)}")
+    if any(not ids for ids in word_ids):
+        raise ValueError("Transcript contains a word with no CTC-supported characters")
 
     labels = []
     ranges = []
@@ -172,6 +188,8 @@ def main():
 
     print(f"Done: aligned={aligned}, skipped={skipped}, output={args.output}")
     print("Word timings are approximate; they are not phoneme-level ground truth.")
+    if aligned == 0:
+        raise RuntimeError("No samples aligned; refusing to continue with an empty alignment file")
 
 
 if __name__ == "__main__":
