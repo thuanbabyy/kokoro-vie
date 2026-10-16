@@ -52,7 +52,7 @@ def distribute_word_frames(phone_word, frame_count):
 
 class AlignedVieNeuDataset(Dataset):
     def __init__(self, metadata_path, alignment_path, wav_dir, speaker_to_id):
-        import librosa
+        import soundfile as sf
 
         self.wav_dir = wav_dir
         self.speaker_to_id = speaker_to_id
@@ -101,7 +101,8 @@ class AlignedVieNeuDataset(Dataset):
                 if not os.path.isfile(wav_path):
                     continue
 
-                audio_duration = librosa.get_duration(path=wav_path)
+                audio_info = sf.info(wav_path)
+                audio_duration = audio_info.frames / audio_info.samplerate
                 start = max(0.0, timings[0]["start"])
                 end = min(audio_duration, timings[-1]["end"])
                 self.items.append({
@@ -112,22 +113,31 @@ class AlignedVieNeuDataset(Dataset):
                     "durations": durations,
                     "crop_start": start,
                     "crop_end": end,
+                    "sample_rate": audio_info.samplerate,
+                    "audio_frames": audio_info.frames,
                 })
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, index):
-        import librosa
+        import soundfile as sf
+        from scipy.signal import resample_poly
 
         item = self.items[index]
-        audio, _ = librosa.load(item["wav"], sr=24000, mono=True)
-        start = int(item["crop_start"] * 24000)
-        end = min(len(audio), int(item["crop_end"] * 24000))
-        audio = audio[start:end]
+        start = max(0, int(item["crop_start"] * item["sample_rate"]))
+        stop = min(item["audio_frames"], int(item["crop_end"] * item["sample_rate"]))
+        audio, sample_rate = sf.read(
+            item["wav"], start=start, stop=stop, dtype="float32", always_2d=True
+        )
+        audio = audio.mean(axis=1)
+        if sample_rate != 24000:
+            divisor = math.gcd(sample_rate, 24000)
+            audio = resample_poly(audio, 24000 // divisor, sample_rate // divisor)
+            audio = audio.astype("float32", copy=False)
         return {
             "id": item["id"],
-            "audio": torch.tensor(audio, dtype=torch.float32),
+            "audio": torch.from_numpy(audio),
             "speaker_id": item["speaker_id"],
             "token_ids": item["token_ids"],
             "durations": item["durations"],
@@ -149,15 +159,14 @@ def collate_aligned(batch):
 
     for row, item in enumerate(batch):
         ids = item["token_ids"]
-        durations = item["durations"]
+        durations = torch.as_tensor(item["durations"], dtype=torch.long)
         token_ids[row, :len(ids)] = torch.tensor(ids)
         token_lengths[row] = len(ids)
-        duration_targets[row, :len(ids)] = torch.tensor(durations, dtype=torch.float32)
-        frame = 0
-        for token_index, duration in enumerate(durations):
-            if duration:
-                alignment[row, token_index, frame:frame + duration] = 1.0
-            frame += duration
+        duration_targets[row, :len(ids)] = durations
+        frame_count = int(durations.sum().item())
+        if frame_count:
+            token_positions = torch.repeat_interleave(torch.arange(len(ids)), durations)
+            alignment[row, token_positions, torch.arange(frame_count)] = 1.0
         sample = item["audio"]
         audio[row, :sample.numel()] = sample
         audio_lengths[row] = sample.numel()
@@ -279,6 +288,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4,
                         help="CPU workers for loading audio; use 0 to disable multiprocessing")
+    parser.add_argument("--precision", choices=("auto", "bf16", "fp32"), default="auto",
+                        help="Use BF16 autocast when supported; otherwise auto uses FP32")
     parser.add_argument("--save-every-steps", type=int, default=250,
                         help="Save a resumable checkpoint every N optimizer steps")
     parser.add_argument("--resume", help="Resume from kokoro_vi_experimental_last.pt")
@@ -290,6 +301,11 @@ def main():
         raise ValueError("Use either --resume or --init-adapter, not both")
     if args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
+    use_bf16 = CFG["device"] == "cuda" and args.precision != "fp32"
+    if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("This GPU does not support BF16; use --precision fp32 or auto")
+    use_bf16 = use_bf16 and torch.cuda.is_bf16_supported()
+    print(f"Precision: {'bf16' if use_bf16 else 'fp32'}")
     if args.save_every_steps < 1:
         raise ValueError("--save-every-steps must be >= 1")
 
@@ -409,9 +425,14 @@ def main():
         target_durations = batch["duration_targets"].to(CFG["device"], non_blocking=pin_memory)
         speaker_ids = batch["speaker_ids"].to(CFG["device"], non_blocking=pin_memory)
         styles = base_voice.unsqueeze(0) + speaker_deltas(speaker_ids)
-        prediction, predicted_durations = train_forward(
-            model, token_ids, token_lengths, alignment, styles
-        )
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            prediction, predicted_durations = train_forward(
+                model, token_ids, token_lengths, alignment, styles
+            )
+        prediction = prediction.float()
+        predicted_durations = predicted_durations.float()
         valid = torch.arange(token_ids.shape[1], device=CFG["device"])[None, :] < token_lengths[:, None]
         duration_loss = F.smooth_l1_loss(
             predicted_durations[valid], target_durations[valid]
