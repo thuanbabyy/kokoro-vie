@@ -277,6 +277,7 @@ def main():
                         help="Limit training rows for the first pilot; 0 uses all rows")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--resume", help="Resume from kokoro_vi_experimental_last.pt")
     args = parser.parse_args()
     if not args.train:
         raise SystemExit("Pass --train to start the experimental loop; generate CTC alignments first.")
@@ -307,14 +308,36 @@ def main():
                 symbols.update(row["phoneme"])
     speaker_to_id = {speaker: index for index, speaker in enumerate(sorted(speakers))}
     model = KModel(config=config_path, model=checkpoint_path)
-    additions, base_vocab_size = expand_model_vocab(model, symbols)
+    resume_payload = None
+    if args.resume:
+        resume_payload = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if resume_payload["speaker_to_id"] != speaker_to_id:
+            raise ValueError("Speaker map changed since checkpoint; refusing an unsafe resume")
+        expected_args = {
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "max_samples": args.max_samples,
+        }
+        if resume_payload.get("training_args") != expected_args:
+            raise ValueError(
+                "Resume requires the original --epochs, --batch-size, and --max-samples values: "
+                f"checkpoint={resume_payload.get('training_args')}, current={expected_args}"
+            )
+        model = load_experimental_adapter(model, resume_payload)
+        additions = resume_payload["added_tokens"]
+        base_vocab_size = resume_payload["base_vocab_size"]
+    else:
+        additions, base_vocab_size = expand_model_vocab(model, symbols)
+        inject_bert_lora(model)
     CFG["active_vocab"] = model.vocab
-    inject_bert_lora(model)
 
     pipeline = KPipeline(lang_code="a", model=False)
     base_voice = pipeline.load_voice("af_heart").reshape(-1, 256).mean(0)
     speaker_deltas = nn.Embedding(len(speaker_to_id), 256).to(CFG["device"])
     nn.init.zeros_(speaker_deltas.weight)
+    if resume_payload is not None:
+        speaker_deltas.weight.data.copy_(resume_payload["speaker_deltas"])
+        base_voice = resume_payload["base_voice"]
     base_voice = base_voice.to(CFG["device"])
     model = model.to(CFG["device"])
     for embedding in (model.bert.embeddings.word_embeddings, model.text_encoder.embedding):
@@ -392,7 +415,49 @@ def main():
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=CFG["lr"], total_steps=total_steps, pct_start=0.1
     )
-    for epoch in range(1, args.epochs + 1):
+    if resume_payload is not None:
+        optimizer.load_state_dict(resume_payload["optimizer"])
+        scheduler.load_state_dict(resume_payload["scheduler"])
+        start_epoch = resume_payload["epoch"] + 1
+        print(f"Resuming at epoch {start_epoch}/{args.epochs}")
+    else:
+        start_epoch = 1
+
+    os.makedirs(CFG["output_dir"], exist_ok=True)
+    last_checkpoint_path = os.path.join(CFG["output_dir"], "kokoro_vi_experimental_last.pt")
+
+    def make_checkpoint(epoch):
+        lora_state = {
+            key: value.detach().cpu()
+            for key, value in model.state_dict().items()
+            if "lora_A" in key or "lora_B" in key
+        }
+        return {
+            "lora": lora_state,
+            "added_tokens": additions,
+            "bert_embedding_rows": model.bert.embeddings.word_embeddings.weight[base_vocab_size:].detach().cpu(),
+            "text_embedding_rows": model.text_encoder.embedding.weight[base_vocab_size:].detach().cpu(),
+            "base_vocab_size": base_vocab_size,
+            "speaker_to_id": speaker_to_id,
+            "speaker_deltas": speaker_deltas.weight.detach().cpu(),
+            "base_voice": base_voice.detach().cpu(),
+            "alignment": "CTC word timing with estimated per-phoneme durations",
+            "epoch": epoch,
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "training_args": {
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "max_samples": args.max_samples,
+            },
+        }
+
+    def save_checkpoint(path, payload):
+        temporary_path = path + ".tmp"
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, path)
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         speaker_deltas.train()
         running = []
@@ -444,25 +509,14 @@ def main():
             f"epoch={epoch} train_loss={sum(running) / max(1, len(running)):.4f} "
             f"val_loss={validation if validation is not None else 'n/a'}"
         )
+        save_checkpoint(last_checkpoint_path, make_checkpoint(epoch))
+        print(f"Saved resumable checkpoint: {last_checkpoint_path}")
 
-    os.makedirs(CFG["output_dir"], exist_ok=True)
     adapter_path = os.path.join(CFG["output_dir"], "kokoro_vi_experimental.pt")
-    lora_state = {
-        key: value.detach().cpu()
-        for key, value in model.state_dict().items()
-        if "lora_A" in key or "lora_B" in key
-    }
-    torch.save({
-        "lora": lora_state,
-        "added_tokens": additions,
-        "bert_embedding_rows": model.bert.embeddings.word_embeddings.weight[base_vocab_size:].detach().cpu(),
-        "text_embedding_rows": model.text_encoder.embedding.weight[base_vocab_size:].detach().cpu(),
-        "base_vocab_size": base_vocab_size,
-        "speaker_to_id": speaker_to_id,
-        "speaker_deltas": speaker_deltas.weight.detach().cpu(),
-        "base_voice": base_voice.detach().cpu(),
-        "alignment": "CTC word timing with estimated per-phoneme durations",
-    }, adapter_path)
+    final_epoch = min(args.epochs, resume_payload["epoch"] if resume_payload else 0)
+    if start_epoch <= args.epochs:
+        final_epoch = args.epochs
+    save_checkpoint(adapter_path, make_checkpoint(final_epoch))
     print(f"Saved experimental adapter: {adapter_path}")
     print("This checkpoint requires a matching custom loader; it is not merge_lora.py compatible.")
 
