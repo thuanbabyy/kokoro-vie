@@ -16,64 +16,47 @@ SAMPLE_RATE = 16000
 KOKORO_FRAME_RATE = 40
 
 
-def ctc_viterbi(log_probs, labels, blank_id):
-    """Return frame spans for each label in a forced CTC alignment."""
+def ctc_forced_spans(log_probs, labels, blank_id):
+    """Return frame spans using torchaudio's optimized CTC alignment kernel."""
     if not labels:
         raise ValueError("Cannot align an empty transcript")
 
-    states = [blank_id]
-    for label in labels:
-        states.extend((label, blank_id))
+    import torchaudio.functional as audio_functional
 
-    frames, state_count = log_probs.shape[0], len(states)
-    if frames < len(labels):
-        raise ValueError("Audio is too short for the transcript")
-
-    scores = log_probs.new_full((state_count,), float("-inf"))
-    scores[0] = log_probs[0, blank_id]
-    scores[1] = log_probs[0, labels[0]]
-    backpointers = torch.full((frames, state_count), -1, dtype=torch.int32)
-
-    for frame in range(1, frames):
-        next_scores = log_probs.new_full((state_count,), float("-inf"))
-        for state, token in enumerate(states):
-            candidates = [scores[state]]
-            sources = [state]
-            if state > 0:
-                candidates.append(scores[state - 1])
-                sources.append(state - 1)
-            if (state > 1 and token != blank_id
-                    and token != states[state - 2]):
-                candidates.append(scores[state - 2])
-                sources.append(state - 2)
-
-            candidate_scores = torch.stack(candidates)
-            best = int(candidate_scores.argmax().item())
-            next_scores[state] = candidate_scores[best] + log_probs[frame, token]
-            backpointers[frame, state] = sources[best]
-        scores = next_scores
-
-    state = state_count - 1
-    if scores[state - 1] > scores[state]:
-        state -= 1
-    if not torch.isfinite(scores[state]):
-        raise ValueError("No valid CTC path")
-
-    path = [state]
-    for frame in range(frames - 1, 0, -1):
-        state = int(backpointers[frame, state].item())
-        if state < 0:
-            raise ValueError("Could not backtrack CTC path")
-        path.append(state)
-    path.reverse()
-
+    targets = torch.tensor(labels, dtype=torch.int32, device=log_probs.device).unsqueeze(0)
+    aligned_tokens, _ = audio_functional.forced_align(
+        log_probs.unsqueeze(0), targets, blank=blank_id
+    )
+    path = aligned_tokens[0].detach().cpu().tolist()
     spans = []
-    for label_index in range(len(labels)):
-        label_state = 2 * label_index + 1
-        occupied = [frame for frame, value in enumerate(path) if value == label_state]
-        if not occupied:
-            raise ValueError(f"Transcript token {label_index} received no frames")
-        spans.append((occupied[0], occupied[-1] + 1))
+    active_token = None
+    span_start = 0
+    target_index = 0
+
+    def close_span(end_frame):
+        nonlocal active_token, target_index
+        if active_token is None:
+            return
+        if target_index >= len(labels) or active_token != labels[target_index]:
+            raise ValueError("CTC kernel path does not match the target sequence")
+        spans.append((span_start, end_frame))
+        target_index += 1
+        active_token = None
+
+    for frame, token in enumerate(path):
+        if token == blank_id:
+            close_span(frame)
+        elif active_token is None:
+            active_token = token
+            span_start = frame
+        elif token != active_token:
+            close_span(frame)
+            active_token = token
+            span_start = frame
+    close_span(len(path))
+
+    if target_index != len(labels):
+        raise ValueError(f"CTC path aligned {target_index}/{len(labels)} transcript tokens")
     return spans
 
 
@@ -118,9 +101,9 @@ def align_sample(model, processor, audio_path, text, device):
 
     inputs = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt").input_values.to(device)
     with torch.inference_mode():
-        log_probs = model(inputs).logits[0].log_softmax(-1).cpu()
+        log_probs = model(inputs).logits[0].log_softmax(-1)
 
-    token_spans = ctc_viterbi(log_probs, labels, processor.tokenizer.pad_token_id)
+    token_spans = ctc_forced_spans(log_probs, labels, processor.tokenizer.pad_token_id)
     seconds_per_frame = len(audio) / SAMPLE_RATE / log_probs.shape[0]
     timings = []
     for start, end in ranges:
