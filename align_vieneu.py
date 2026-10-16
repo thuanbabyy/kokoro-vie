@@ -79,8 +79,6 @@ def ctc_viterbi(log_probs, labels, blank_id):
 
 def align_sample(model, processor, audio_path, text, device):
     audio, _ = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
-    if len(audio) / SAMPLE_RATE > 10.0:
-        raise ValueError("Vietnamese CTC checkpoint recommends utterances shorter than 10 seconds")
     normalized = unicodedata.normalize("NFC", text.lower()).strip()
     words = normalized.split()
     if not words:
