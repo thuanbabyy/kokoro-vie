@@ -278,9 +278,12 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--resume", help="Resume from kokoro_vi_experimental_last.pt")
+    parser.add_argument("--init-adapter", help="Warm-start model/LoRA from a completed adapter, with a fresh optimizer")
     args = parser.parse_args()
     if not args.train:
         raise SystemExit("Pass --train to start the experimental loop; generate CTC alignments first.")
+    if args.resume and args.init_adapter:
+        raise ValueError("Use either --resume or --init-adapter, not both")
 
     for path in (args.train_alignment, args.val_alignment):
         if not os.path.isfile(path):
@@ -309,6 +312,7 @@ def main():
     speaker_to_id = {speaker: index for index, speaker in enumerate(sorted(speakers))}
     model = KModel(config=config_path, model=checkpoint_path)
     resume_payload = None
+    init_payload = None
     if args.resume:
         resume_payload = torch.load(args.resume, map_location="cpu", weights_only=False)
         if resume_payload["speaker_to_id"] != speaker_to_id:
@@ -327,17 +331,26 @@ def main():
         additions = resume_payload["added_tokens"]
         base_vocab_size = resume_payload["base_vocab_size"]
     else:
-        additions, base_vocab_size = expand_model_vocab(model, symbols)
-        inject_bert_lora(model)
+        if args.init_adapter:
+            init_payload = torch.load(args.init_adapter, map_location="cpu", weights_only=False)
+            if init_payload["speaker_to_id"] != speaker_to_id:
+                raise ValueError("Speaker map changed since adapter; refusing an unsafe warm-start")
+            model = load_experimental_adapter(model, init_payload)
+            additions = init_payload["added_tokens"]
+            base_vocab_size = init_payload["base_vocab_size"]
+        else:
+            additions, base_vocab_size = expand_model_vocab(model, symbols)
+            inject_bert_lora(model)
     CFG["active_vocab"] = model.vocab
 
     pipeline = KPipeline(lang_code="a", model=False)
     base_voice = pipeline.load_voice("af_heart").reshape(-1, 256).mean(0)
     speaker_deltas = nn.Embedding(len(speaker_to_id), 256).to(CFG["device"])
     nn.init.zeros_(speaker_deltas.weight)
-    if resume_payload is not None:
-        speaker_deltas.weight.data.copy_(resume_payload["speaker_deltas"])
-        base_voice = resume_payload["base_voice"]
+    starting_payload = resume_payload or init_payload
+    if starting_payload is not None:
+        speaker_deltas.weight.data.copy_(starting_payload["speaker_deltas"])
+        base_voice = starting_payload["base_voice"]
     base_voice = base_voice.to(CFG["device"])
     model = model.to(CFG["device"])
     for embedding in (model.bert.embeddings.word_embeddings, model.text_encoder.embedding):
