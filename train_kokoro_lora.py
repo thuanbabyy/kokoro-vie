@@ -63,9 +63,8 @@ class AlignedVieNeuDataset(Dataset):
                 if not alignment or not row.get("phoneme") or not row.get("speaker"):
                     continue
                 phone_words = row["phoneme"].split()
-                words = alignment["words"]
-                timings = alignment["word_timings"]
-                if len(phone_words) != len(words) or len(words) != len(timings):
+                timings = alignment.get("phoneme_timings", [])
+                if len(phone_words) != len(timings):
                     continue
 
                 token_ids = [0]

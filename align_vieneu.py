@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import unicodedata
 
 import librosa
@@ -58,6 +59,74 @@ def ctc_forced_spans(log_probs, labels, blank_id):
     if target_index != len(labels):
         raise ValueError(f"CTC path aligned {target_index}/{len(labels)} transcript tokens")
     return spans
+
+
+def map_word_timings_to_phonemes(words, word_timings, phoneme_words):
+    """Expand number words and distribute their CTC span across phone groups."""
+    from num2words import num2words
+
+    group_counts = [1] * len(words)
+    number_indices = []
+    number_values = {}
+    for index, word in enumerate(words):
+        number = word.strip(".,;:!?()[]{}\"'")
+        if not re.fullmatch(r"\d+", number):
+            continue
+        try:
+            spoken_words = num2words(int(number), lang="vi").split()
+        except (NotImplementedError, OverflowError, ValueError) as error:
+            raise ValueError(f"Cannot normalize numeric token {word!r} to Vietnamese") from error
+        group_counts[index] = max(1, len(spoken_words))
+        number_indices.append(index)
+        number_values[index] = int(number)
+
+    difference = len(phoneme_words) - sum(group_counts)
+    if difference and not number_indices:
+        raise ValueError(
+            f"word/phoneme mismatch ({len(words)} words, {len(phoneme_words)} phoneme groups; no number to expand)"
+        )
+    if abs(difference) > max(1, len(number_indices)):
+        raise ValueError(
+            f"number expansion does not explain mismatch ({sum(group_counts)} predicted groups, "
+            f"{len(phoneme_words)} actual groups)"
+        )
+
+    if difference > 0:
+        index = max(number_indices, key=lambda item: len(str(number_values[item])))
+        group_counts[index] += difference
+    elif difference < 0:
+        for index in sorted(number_indices, key=lambda item: group_counts[item], reverse=True):
+            reduction = min(group_counts[index] - 1, -difference)
+            group_counts[index] -= reduction
+            difference += reduction
+            if difference == 0:
+                break
+        if difference:
+            raise ValueError("Cannot reconcile number normalization with phoneme groups")
+
+    if len(words) != len(word_timings) or sum(group_counts) != len(phoneme_words):
+        raise ValueError("Word timings cannot be mapped to the phoneme groups")
+
+    phone_timings = []
+    for word_index, group_count in enumerate(group_counts):
+        timing = word_timings[word_index]
+        total_frames = timing["duration_frames"]
+        if total_frames < group_count:
+            raise ValueError("Aligned word is too short to allocate to its phoneme groups")
+        base_frames, remainder = divmod(total_frames, group_count)
+        elapsed_frames = 0
+        span_seconds = timing["end"] - timing["start"]
+        for group_index in range(group_count):
+            group_frames = base_frames + (1 if group_index < remainder else 0)
+            start_fraction = elapsed_frames / total_frames
+            elapsed_frames += group_frames
+            end_fraction = elapsed_frames / total_frames
+            phone_timings.append({
+                "start": timing["start"] + span_seconds * start_fraction,
+                "end": timing["start"] + span_seconds * end_fraction,
+                "duration_frames": group_frames,
+            })
+    return phone_timings
 
 
 def align_sample(model, processor, audio_path, text, device):
@@ -151,7 +220,11 @@ def main():
                 if not line.strip():
                     continue
                 try:
-                    existing_ids.add(json.loads(line)["id"])
+                    record = json.loads(line)
+                    phoneme_words = record.get("phoneme_words") or []
+                    phoneme_timings = record.get("phoneme_timings") or []
+                    if record.get("id") and phoneme_words and len(phoneme_timings) == len(phoneme_words):
+                        existing_ids.add(record["id"])
                 except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as error:
                     raise ValueError(
                         f"Cannot resume: invalid record in {args.output} at line {line_number}"
@@ -173,16 +246,14 @@ def main():
             try:
                 words, timings = align_sample(model, processor, wav_path, row["text"], device)
                 phoneme_words = row["phoneme"].split()
-                if len(words) != len(phoneme_words):
-                    raise ValueError(
-                        f"word/phoneme count mismatch ({len(words)} vs {len(phoneme_words)})"
-                    )
+                phoneme_timings = map_word_timings_to_phonemes(words, timings, phoneme_words)
                 record = {
                     "id": row["id"],
                     "speaker": row["speaker"],
                     "words": words,
                     "phoneme_words": phoneme_words,
                     "word_timings": timings,
+                    "phoneme_timings": phoneme_timings,
                 }
                 target.write(json.dumps(record, ensure_ascii=False) + "\n")
                 target.flush()
