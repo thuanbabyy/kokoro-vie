@@ -28,6 +28,29 @@ def cpu_state_dict(module):
     return {key: value.detach().cpu() for key, value in module.state_dict().items()}
 
 
+def save_loss_chart(history, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    epochs = [entry["epoch"] for entry in history]
+    figure, axis = plt.subplots(figsize=(8, 5))
+    axis.plot(epochs, [entry["train_loss"] for entry in history], marker="o", label="Train")
+    val_points = [(entry["epoch"], entry["val_loss"])
+                  for entry in history if entry["val_loss"] is not None]
+    if val_points:
+        axis.plot([point[0] for point in val_points], [point[1] for point in val_points],
+                  marker="o", label="Validation")
+    axis.set_xlabel("Epoch")
+    axis.set_ylabel("Loss")
+    axis.set_title("Kokoro Vietnamese full fine-tuning loss")
+    axis.grid(True, alpha=0.3)
+    axis.legend()
+    figure.tight_layout()
+    figure.savefig(path, dpi=160)
+    plt.close(figure)
+
+
 def merge_lora_warm_start(model, adapter_payload):
     """Optional one-time conversion from the existing pilot LoRA to full weights."""
     from lora_trainer import LoRALinear
@@ -352,6 +375,10 @@ def main():
     print(f"Saved full Kokoro model: {weights_out}")
     print(f"Saved expanded config: {config_out}")
     print(f"Saved speaker vectors: {speaker_out}")
+    if history:
+        chart_path = os.path.join(output_dir, "kokoro_vi_full_loss.png")
+        save_loss_chart(history, chart_path)
+        print(f"Saved full-training loss chart: {chart_path}")
 
 
 if __name__ == "__main__":
