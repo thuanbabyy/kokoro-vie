@@ -12,8 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
-from lora_trainer import (
-    CFG,
+from lora_trainer import CFG
+from train_kokoro_lora import (
     AlignedVieNeuDataset,
     collate_aligned,
     expand_model_vocab,
