@@ -11,6 +11,7 @@ from collections import Counter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import soundfile as sf
 from torch.utils.data import DataLoader, Dataset
 
 from lora_trainer import CFG, LoRALinear
@@ -107,6 +108,7 @@ class AlignedVieNeuDataset(Dataset):
                     "id": row["id"],
                     "wav": wav_path,
                     "speaker_id": speaker_to_id[row["speaker"]],
+                    "phonemes": row["phoneme"],
                     "token_ids": token_ids,
                     "durations": durations,
                     "crop_start": start,
@@ -278,6 +280,50 @@ def train_forward(model, token_ids, token_lengths, alignment, styles):
     return generated, duration_prediction
 
 
+def save_loss_plot(history, output_path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    epochs = [entry["epoch"] for entry in history]
+    train_losses = [entry["train_loss"] for entry in history]
+    val_losses = [entry["val_loss"] for entry in history]
+
+    figure, axis = plt.subplots(figsize=(8, 5))
+    axis.plot(epochs, train_losses, marker="o", label="Train")
+    available_val = [index for index, value in enumerate(val_losses) if value is not None]
+    if available_val:
+        axis.plot(
+            [epochs[index] for index in available_val],
+            [val_losses[index] for index in available_val],
+            marker="o",
+            label="Validation",
+        )
+    axis.set_xlabel("Epoch")
+    axis.set_ylabel("Loss")
+    axis.set_title("Kokoro Vietnamese LoRA training loss")
+    axis.grid(True, alpha=0.3)
+    axis.legend()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
+
+
+def choose_sample(dataset, sample_id=None):
+    if dataset is None:
+        return None
+    if sample_id:
+        return next(
+            (item for item in dataset.items
+             if item["id"] == sample_id and len(item["token_ids"]) <= 510),
+            None,
+        )
+    return next(
+        (item for item in dataset.items if len(item["token_ids"]) <= 510),
+        None,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Experimental Kokoro Vietnamese LoRA training")
     parser.add_argument("--train", action="store_true", help="Run the experimental trainer")
@@ -295,6 +341,7 @@ def main():
                         help="Save a resumable checkpoint every N optimizer steps")
     parser.add_argument("--resume", help="Resume from kokoro_vi_experimental_last.pt")
     parser.add_argument("--init-adapter", help="Warm-start model/LoRA from a completed adapter, with a fresh optimizer")
+    parser.add_argument("--sample-id", help="Validation sample ID to synthesize after training")
     args = parser.parse_args()
     if not args.train:
         raise SystemExit("Pass --train to start the experimental loop; generate CTC alignments first.")
@@ -366,6 +413,7 @@ def main():
         else:
             additions, base_vocab_size = expand_model_vocab(model, symbols)
             inject_bert_lora(model)
+    history = list(resume_payload.get("history", [])) if resume_payload is not None else []
     CFG["active_vocab"] = model.vocab
 
     pipeline = KPipeline(lang_code="a", model=False)
@@ -526,6 +574,7 @@ def main():
             "epoch_order": epoch_order,
             "epoch_loss_sum": loss_sum,
             "epoch_loss_count": loss_count,
+            "history": history,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "torch_rng_state": torch.get_rng_state(),
@@ -632,6 +681,11 @@ def main():
             f"epoch={epoch} train_loss={running_sum / max(1, running_count):.4f} "
             f"val_loss={validation if validation is not None else 'n/a'}"
         )
+        history.append({
+            "epoch": epoch,
+            "train_loss": running_sum / max(1, running_count),
+            "val_loss": validation,
+        })
         save_checkpoint(
             last_checkpoint_path,
             make_checkpoint(epoch, steps_per_epoch, epoch_order, running_sum, running_count),
@@ -652,6 +706,34 @@ def main():
     save_checkpoint(adapter_path, final_payload)
     print(f"Saved experimental adapter: {adapter_path}")
     print("This checkpoint requires a matching custom loader; it is not merge_lora.py compatible.")
+
+    if history:
+        chart_path = os.path.join(CFG["output_dir"], "loss_curve.png")
+        save_loss_plot(history, chart_path)
+        print(f"Saved loss chart: {chart_path}")
+
+    sample = choose_sample(val_dataset, args.sample_id) or choose_sample(train_dataset, args.sample_id)
+    if sample is None:
+        print("[WARN] No short aligned sample found for automatic synthesis")
+    else:
+        style = base_voice + speaker_deltas.weight[sample["speaker_id"]]
+        voice_pack = style.reshape(1, 1, 256).expand(512, 1, 256).contiguous()
+        model.eval()
+        speaker_deltas.eval()
+        try:
+            result = next(
+                pipeline.generate_from_tokens(
+                    sample["phonemes"], voice=voice_pack, model=model
+                ),
+                None,
+            )
+            if result is None or result.audio is None:
+                raise RuntimeError("Kokoro returned no audio")
+            audio_path = os.path.join(CFG["output_dir"], "trained_sample.wav")
+            sf.write(audio_path, result.audio.detach().cpu().numpy(), 24000)
+            print(f"Saved generated sample: {audio_path} (ID: {sample['id']})")
+        except Exception as error:
+            print(f"[WARN] Could not synthesize sample {sample['id']}: {error}")
 
 
 if __name__ == "__main__":
