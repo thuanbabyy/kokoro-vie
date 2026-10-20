@@ -107,6 +107,8 @@ def main():
     parser.add_argument("--precision", choices=("auto", "bf16", "fp32"), default="auto")
     parser.add_argument("--lr", type=float, default=1e-5,
                         help="Learning rate for full-parameter fine-tuning")
+    parser.add_argument("--train-decoder", action="store_true",
+                        help="Also update the iSTFTNet decoder (requires a proper vocoder loss)")
     parser.add_argument("--resume", help="Resume full training from kokoro_vi_full_last.pt")
     parser.add_argument("--init-adapter", help="Warm-start once from the existing LoRA pilot")
     args = parser.parse_args()
@@ -157,6 +159,7 @@ def main():
             "batch_size": args.batch_size,
             "max_samples": args.max_samples,
             "lr": args.lr,
+            "train_decoder": args.train_decoder,
         }
         if resume_payload.get("training_args") != expected:
             raise ValueError(f"Resume requires unchanged training arguments: {expected}")
@@ -179,6 +182,11 @@ def main():
     CFG["active_vocab"] = model.vocab
     for parameter in model.parameters():
         parameter.requires_grad_(True)
+    if not args.train_decoder:
+        # A mel-only loss is insufficient to retrain the waveform decoder.
+        # Gradients still flow through the frozen decoder into upstream modules.
+        for parameter in model.decoder.parameters():
+            parameter.requires_grad_(False)
 
     pipeline = KPipeline(lang_code="a", model=False)
     base_voice = pipeline.load_voice("af_heart").reshape(-1, 256).mean(0)
@@ -195,7 +203,11 @@ def main():
     speaker_deltas = speaker_deltas.to(CFG["device"])
     base_voice = base_voice.to(CFG["device"])
     trainable_count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-    print(f"Full fine-tune parameters: {trainable_count:,}/{sum(p.numel() for p in model.parameters()):,}")
+    decoder_mode = "trainable" if args.train_decoder else "frozen"
+    print(
+        f"Full fine-tune parameters: {trainable_count:,}/{sum(p.numel() for p in model.parameters()):,} "
+        f"| decoder: {decoder_mode}"
+    )
 
     train_dataset = AlignedVieNeuDataset(
         CFG["train_meta"], args.train_alignment, CFG["wav_dir"], speaker_to_id
@@ -220,7 +232,8 @@ def main():
         loader_options.update(persistent_workers=True, prefetch_factor=2)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_options) if val_dataset else None
 
-    parameters = list(model.parameters()) + list(speaker_deltas.parameters())
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    parameters += list(speaker_deltas.parameters())
     optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=0.01)
     import torchaudio.transforms as T
     mel_transform = T.MelSpectrogram(
@@ -317,7 +330,8 @@ def main():
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "training_args": {"epochs": args.epochs, "batch_size": args.batch_size,
-                              "max_samples": args.max_samples, "lr": args.lr},
+                              "max_samples": args.max_samples, "lr": args.lr,
+                              "train_decoder": args.train_decoder},
         }
 
     def save_full_checkpoint(path, payload):
@@ -346,6 +360,9 @@ def main():
         epoch_dataset = Subset(train_dataset, sample_order[first_step * args.batch_size:])
         train_loader = DataLoader(epoch_dataset, shuffle=False, **loader_options)
         model.train()
+        if not args.train_decoder:
+            # Keep the pretrained vocoder's normalization/dropout state fixed.
+            model.decoder.eval()
         speaker_deltas.train()
         if restore_rng:
             if resume_payload.get("torch_rng_state") is not None:
