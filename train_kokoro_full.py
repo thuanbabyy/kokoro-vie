@@ -2,6 +2,7 @@
 """Experimental full-parameter Vietnamese fine-tuning for Kokoro."""
 import argparse
 import csv
+import html
 import json
 import math
 import os
@@ -28,27 +29,52 @@ def cpu_state_dict(module):
     return {key: value.detach().cpu() for key, value in module.state_dict().items()}
 
 
-def save_loss_chart(history, path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+def save_training_report(history, events, path):
+    """Write one self-contained HTML file with the loss chart and run log."""
+    width, height, pad = 800, 360, 55
+    chart = "<p>Chưa có epoch nào hoàn thành.</p>"
+    if history:
+        losses = [entry["train_loss"] for entry in history]
+        losses.extend(entry["val_loss"] for entry in history if entry["val_loss"] is not None)
+        low, high = min(losses), max(losses)
+        if low == high:
+            low, high = low - 0.5, high + 0.5
+        epoch_min, epoch_max = history[0]["epoch"], history[-1]["epoch"]
 
-    epochs = [entry["epoch"] for entry in history]
-    figure, axis = plt.subplots(figsize=(8, 5))
-    axis.plot(epochs, [entry["train_loss"] for entry in history], marker="o", label="Train")
-    val_points = [(entry["epoch"], entry["val_loss"])
-                  for entry in history if entry["val_loss"] is not None]
-    if val_points:
-        axis.plot([point[0] for point in val_points], [point[1] for point in val_points],
-                  marker="o", label="Validation")
-    axis.set_xlabel("Epoch")
-    axis.set_ylabel("Loss")
-    axis.set_title("Kokoro Vietnamese full fine-tuning loss")
-    axis.grid(True, alpha=0.3)
-    axis.legend()
-    figure.tight_layout()
-    figure.savefig(path, dpi=160)
-    plt.close(figure)
+        def point(epoch, loss):
+            x = pad + (epoch - epoch_min) * (width - 2 * pad) / max(1, epoch_max - epoch_min)
+            y = height - pad - (loss - low) * (height - 2 * pad) / (high - low)
+            return f"{x:.1f},{y:.1f}"
+
+        train_points = " ".join(point(entry["epoch"], entry["train_loss"]) for entry in history)
+        val_points = " ".join(
+            point(entry["epoch"], entry["val_loss"])
+            for entry in history if entry["val_loss"] is not None
+        )
+        val_line = f'<polyline points="{val_points}" class="val" />' if val_points else ""
+        chart = f'''<svg viewBox="0 0 {width} {height}" role="img" aria-label="Loss by epoch">
+  <style>.axis{{stroke:#555}} .train{{fill:none;stroke:#1769aa;stroke-width:3}} .val{{fill:none;stroke:#d1495b;stroke-width:3}} text{{font:14px sans-serif}}</style>
+  <line x1="{pad}" y1="{height - pad}" x2="{width - pad}" y2="{height - pad}" class="axis" />
+  <line x1="{pad}" y1="{pad}" x2="{pad}" y2="{height - pad}" class="axis" />
+  <polyline points="{train_points}" class="train" />{val_line}
+  <text x="{pad}" y="25">Loss (min {low:.4f}, max {high:.4f})</text>
+  <text x="{width - 210}" y="25" fill="#1769aa">Train</text>
+  <text x="{width - 120}" y="25" fill="#d1495b">Validation</text>
+  <text x="{pad}" y="{height - 15}">Epoch {epoch_min}</text>
+  <text x="{width - pad - 55}" y="{height - 15}">Epoch {epoch_max}</text>
+</svg>'''
+    rows = "\n".join(
+        "<tr>" + "".join(f"<td>{html.escape(str(event.get(key, '')))}</td>" for key in ("epoch", "event", "train_loss", "val_loss")) + "</tr>"
+        for event in events
+    )
+    document = f'''<!doctype html>
+<html lang="vi"><meta charset="utf-8"><title>Kokoro full training report</title>
+<style>body{{font-family:system-ui,sans-serif;margin:2rem;max-width:900px}} svg{{width:100%;border:1px solid #ddd}} table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #ddd;padding:.5rem;text-align:left}}</style>
+<h1>Kokoro Vietnamese full fine-tuning</h1><h2>Loss chart</h2>{chart}
+<h2>Training log</h2><table><tr><th>Epoch</th><th>Event</th><th>Train loss</th><th>Validation loss</th></tr>{rows}</table>
+</html>'''
+    with open(path, "w", encoding="utf-8") as target:
+        target.write(document)
 
 
 def merge_lora_warm_start(model, adapter_payload):
@@ -81,8 +107,6 @@ def main():
     parser.add_argument("--precision", choices=("auto", "bf16", "fp32"), default="auto")
     parser.add_argument("--lr", type=float, default=1e-5,
                         help="Learning rate for full-parameter fine-tuning")
-    parser.add_argument("--save-every-steps", type=int, default=5000,
-                        help="Full checkpoints are large; 0 saves only at epoch boundaries")
     parser.add_argument("--resume", help="Resume full training from kokoro_vi_full_last.pt")
     parser.add_argument("--init-adapter", help="Warm-start once from the existing LoRA pilot")
     args = parser.parse_args()
@@ -91,8 +115,8 @@ def main():
         raise SystemExit("Pass --train to start full-parameter fine-tuning.")
     if args.resume and args.init_adapter:
         raise ValueError("Use either --resume or --init-adapter, not both")
-    if args.num_workers < 0 or args.save_every_steps < 0:
-        raise ValueError("num-workers and save-every-steps must be >= 0")
+    if args.num_workers < 0:
+        raise ValueError("num-workers must be >= 0")
     if args.lr <= 0:
         raise ValueError("--lr must be > 0")
 
@@ -260,14 +284,17 @@ def main():
             running_sum = 0.0
             running_count = 0
         history = resume_payload["history"]
+        log_events = resume_payload.get("log_events", [])
         print(f"Resume full train epoch={start_epoch}, step={start_step}/{steps_per_epoch}")
     else:
         start_epoch, start_step, order, history = 1, 0, None, []
+        log_events = []
         running_sum, running_count = 0.0, 0
 
     output_dir = CFG["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
     last_path = os.path.join(output_dir, "kokoro_vi_full_last.pt")
+    report_path = os.path.join(output_dir, "kokoro_vi_full_training_report.html")
 
     def checkpoint(epoch, step, sample_order, loss_sum, loss_count):
         return {
@@ -286,6 +313,7 @@ def main():
             "loss_sum": loss_sum,
             "loss_count": loss_count,
             "history": history,
+            "log_events": log_events,
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "training_args": {"epochs": args.epochs, "batch_size": args.batch_size,
@@ -300,7 +328,9 @@ def main():
     if resume_payload is None:
         generator = torch.Generator().manual_seed(1000 + start_epoch)
         order = torch.randperm(len(train_dataset), generator=generator).tolist()
+        log_events.append({"epoch": start_epoch, "event": "Training started", "train_loss": "", "val_loss": ""})
         save_full_checkpoint(last_path, checkpoint(start_epoch, 0, order, 0.0, 0))
+        save_training_report(history, log_events, report_path)
 
     restore_rng = resume_payload is not None
     for epoch in range(start_epoch, args.epochs + 1):
@@ -342,10 +372,6 @@ def main():
             if step % 10 == 0:
                 print(f"epoch={epoch} step={step}/{steps_per_epoch} loss={loss.item():.4f} "
                       f"mel={mel_loss.item():.4f} duration={duration_loss.item():.4f}")
-            if args.save_every_steps and step % args.save_every_steps == 0:
-                save_full_checkpoint(last_path, checkpoint(epoch, step, sample_order, running_sum, running_count))
-                print(f"Saved full checkpoint: epoch={epoch} step={step}")
-
         val_loss = None
         if val_loader:
             model.eval()
@@ -358,7 +384,14 @@ def main():
         train_loss = running_sum / max(1, running_count)
         history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
         print(f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val_loss}")
+        log_events.append({"epoch": epoch, "event": "Epoch complete", "train_loss": f"{train_loss:.6f}",
+                           "val_loss": "" if val_loss is None else f"{val_loss:.6f}"})
         save_full_checkpoint(last_path, checkpoint(epoch, steps_per_epoch, sample_order, running_sum, running_count))
+        epoch_path = os.path.join(output_dir, f"kokoro_vi_full_epoch_{epoch:03d}.pt")
+        save_full_checkpoint(epoch_path, checkpoint(epoch, steps_per_epoch, sample_order, running_sum, running_count))
+        save_training_report(history, log_events, report_path)
+        print(f"Saved epoch checkpoint: {epoch_path}")
+        print(f"Updated training report: {report_path}")
         start_step, order = 0, None
 
     final_config = dict(base_config)
@@ -376,9 +409,7 @@ def main():
     print(f"Saved expanded config: {config_out}")
     print(f"Saved speaker vectors: {speaker_out}")
     if history:
-        chart_path = os.path.join(output_dir, "kokoro_vi_full_loss.png")
-        save_loss_chart(history, chart_path)
-        print(f"Saved full-training loss chart: {chart_path}")
+        print(f"Saved full training chart and log: {report_path}")
 
 
 if __name__ == "__main__":
