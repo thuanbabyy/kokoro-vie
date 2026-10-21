@@ -109,6 +109,10 @@ def main():
                         help="Learning rate for full-parameter fine-tuning")
     parser.add_argument("--train-decoder", action="store_true",
                         help="Also update the iSTFTNet decoder (requires a proper vocoder loss)")
+    parser.add_argument("--train-predictor", action="store_true",
+                        help="Also update duration/F0/noise prediction (requires a proper acoustic loss)")
+    parser.add_argument("--speaker-delta-l2", type=float, default=1e-4,
+                        help="L2 weight that keeps learned speaker styles near the base voice")
     parser.add_argument("--resume", help="Resume full training from kokoro_vi_full_last.pt")
     parser.add_argument("--init-adapter", help="Warm-start once from the existing LoRA pilot")
     args = parser.parse_args()
@@ -121,6 +125,8 @@ def main():
         raise ValueError("num-workers must be >= 0")
     if args.lr <= 0:
         raise ValueError("--lr must be > 0")
+    if args.speaker_delta_l2 < 0:
+        raise ValueError("--speaker-delta-l2 must be >= 0")
 
     use_bf16 = CFG["device"] == "cuda" and args.precision != "fp32"
     if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
@@ -160,6 +166,8 @@ def main():
             "max_samples": args.max_samples,
             "lr": args.lr,
             "train_decoder": args.train_decoder,
+            "train_predictor": args.train_predictor,
+            "speaker_delta_l2": args.speaker_delta_l2,
         }
         if resume_payload.get("training_args") != expected:
             raise ValueError(f"Resume requires unchanged training arguments: {expected}")
@@ -187,6 +195,11 @@ def main():
         # Gradients still flow through the frozen decoder into upstream modules.
         for parameter in model.decoder.parameters():
             parameter.requires_grad_(False)
+    if not args.train_predictor:
+        # The predictor supplies durations, F0, and noise to the decoder.  A
+        # mel-only objective cannot safely retrain these acoustic controls.
+        for parameter in model.predictor.parameters():
+            parameter.requires_grad_(False)
 
     pipeline = KPipeline(lang_code="a", model=False)
     base_voice = pipeline.load_voice("af_heart").reshape(-1, 256).mean(0)
@@ -204,9 +217,11 @@ def main():
     base_voice = base_voice.to(CFG["device"])
     trainable_count = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     decoder_mode = "trainable" if args.train_decoder else "frozen"
+    predictor_mode = "trainable" if args.train_predictor else "frozen"
     print(
         f"Full fine-tune parameters: {trainable_count:,}/{sum(p.numel() for p in model.parameters()):,} "
-        f"| decoder: {decoder_mode}"
+        f"| decoder: {decoder_mode} | predictor: {predictor_mode} "
+        f"| speaker-delta L2: {args.speaker_delta_l2:g}"
     )
 
     train_dataset = AlignedVieNeuDataset(
@@ -274,7 +289,9 @@ def main():
         if not mel_losses:
             raise RuntimeError("Generated audio was too short for mel loss")
         mel_loss = torch.stack(mel_losses).mean()
-        return mel_loss + 0.1 * duration_loss, mel_loss.detach(), duration_loss.detach()
+        speaker_delta_loss = speaker_deltas.weight.square().mean()
+        total_loss = mel_loss + 0.1 * duration_loss + args.speaker_delta_l2 * speaker_delta_loss
+        return total_loss, mel_loss.detach(), duration_loss.detach()
 
     steps_per_epoch = math.ceil(len(train_dataset) / args.batch_size)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -331,7 +348,9 @@ def main():
             "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "training_args": {"epochs": args.epochs, "batch_size": args.batch_size,
                               "max_samples": args.max_samples, "lr": args.lr,
-                              "train_decoder": args.train_decoder},
+                              "train_decoder": args.train_decoder,
+                              "train_predictor": args.train_predictor,
+                              "speaker_delta_l2": args.speaker_delta_l2},
         }
 
     def save_full_checkpoint(path, payload):
@@ -363,6 +382,9 @@ def main():
         if not args.train_decoder:
             # Keep the pretrained vocoder's normalization/dropout state fixed.
             model.decoder.eval()
+        if not args.train_predictor:
+            # Keep duration/F0/noise in the pretrained acoustic domain.
+            model.predictor.eval()
         speaker_deltas.train()
         if restore_rng:
             if resume_payload.get("torch_rng_state") is not None:
