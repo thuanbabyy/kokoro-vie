@@ -1,5 +1,5 @@
 # Base image PyTorch voi CUDA 12.1
-FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
